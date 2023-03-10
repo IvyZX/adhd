@@ -1,7 +1,7 @@
 """Input pipeline for a LM1B dataset."""
 
 import os
-from typing import Dict, Optional, List, Union
+from typing import Optional
 import functools
 
 import ml_collections
@@ -40,9 +40,10 @@ def shift_inputs_tf(x, segment_ids=None, axis=1):
   # For packed targets, the first shifted token of a new sequence is made
   # 0, rather than being the EOS token for the last sequence.
   if segment_ids is not None:
-    shifted *= tf.cast(segment_ids == shift_right_tf(segment_ids, axis=axis), x.dtype)
+    shifted *= tf.cast(
+        segment_ids == shift_right_tf(segment_ids, axis=axis), x.dtype
+    )
   return shifted
-
 
 def shift_data(x, axis=0, segmented=True):
   segment_ids = x['inputs_segmentation'] if segmented else None
@@ -112,11 +113,16 @@ def preprocessing_pipeline(
 
   # Multihost dataloading: sharding and jax.Array prep function
   dataset_structure = tf.data.experimental.get_structure(dataset)
-  global_data_shape = jax.tree_map(lambda x: P(batch_size, max_length), dataset_structure)
-  data_axes = jax.tree_map(lambda x: P('data', None), dataset_structure)
+  global_data_shape = jax.tree_map(
+      lambda x: P(batch_size, max_length), dataset_structure
+  )
+  data_axes = jax.tree_map(lambda x: P(('data', 'worker'), None), dataset_structure)
 
-  multihost_shard_fn, multihost_gen = multihost_dataloading.get_per_host_data_pipeline(
-    dataset, global_data_shape, global_mesh, data_axes)
+  multihost_shard_fn, multihost_gen = (
+      multihost_dataloading.get_per_host_data_pipeline(
+          dataset, global_data_shape, global_mesh, data_axes
+      )
+  )
 
   # Shard dataset for multihost loading.
   dataset = multihost_shard_fn(dataset)
@@ -141,17 +147,14 @@ def preprocessing_pipeline(
 
 def get_datasets(
   config: ml_collections.ConfigDict,
-  global_mesh,
-  vocab_path: Optional[str] = None
+  read_config = None,
 ):
   """Load and return dataset of batched examples for use during training."""
-  if vocab_path is None:
-    vocab_path = os.path.expanduser('~/lm1b_sentencepiece_model')
-
   # Training dataset.
   train_ds_builder = tfds.builder(config.dataset_name)
   # train_data = get_raw_dataset(train_ds_builder, 'train')
   train_ds = train_ds_builder.as_dataset(split='train',
+                                           read_config = read_config,
                                            shuffle_files=False)
   train_ds = normalize_features(train_ds)
 
@@ -162,8 +165,19 @@ def get_datasets(
     eval_ds_builder = train_ds_builder
   # eval_data = get_raw_dataset(eval_ds_builder, config.eval_split)
   eval_ds = eval_ds_builder.as_dataset(split=config.eval_split,
+                                          read_config = read_config,
                                           shuffle_files=False)
   eval_ds = normalize_features(eval_ds)
+
+  return train_ds, eval_ds
+
+def preprocess_dataset(config: ml_collections.ConfigDict,
+                        global_mesh,
+                        train_ds, eval_ds,
+                        vocab_path: Optional[str] = None,):
+  """Pre-process the dataset and return iterators"""
+  if vocab_path is None:
+    vocab_path = os.path.expanduser('~/lm1b_sentencepiece_model')
 
   # Train or load tokenizer
   sp_tokenizer = tokenizer.load_or_train_tokenizer(
@@ -184,6 +198,11 @@ def get_datasets(
     eval_batch_size = config.eval_per_device_batch_size * global_mesh.size
   else:
     eval_batch_size = batch_size
+
+  def filter_keys(record):
+    return {'inputs': record['inputs'], 'targets': record['targets']}
+  train_ds = train_ds.map(filter_keys,num_parallel_calls=tf.data.AUTOTUNE)
+  eval_ds = eval_ds.map(filter_keys,num_parallel_calls=tf.data.AUTOTUNE)
 
   train_iter = preprocessing_pipeline(
       train_ds,
