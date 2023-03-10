@@ -1,20 +1,23 @@
 """Transformer model definition."""
+# pylint: disable=arguments-differ
 
+import dataclasses
 import functools
 import operator
 from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
 
-import dataclasses
 
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
+
+import numpy as np
 
 import jax
 from jax import lax
 from jax import random
 import jax.numpy as jnp
 
-import numpy as np
+
 
 
 withLP = nn.with_logical_partitioning
@@ -41,6 +44,7 @@ default_embed_init = nn.initializers.variance_scaling(
 #------------------------------------------------------------------------------
 # Dot product attention layer.
 #------------------------------------------------------------------------------
+
 
 def dot_product_attention(query: Array,
                           key: Array,
@@ -124,6 +128,7 @@ dynamic_vector_slice_in_dim = jax.vmap(
 # DenseGeneral for attention layers.
 #------------------------------------------------------------------------------
 
+
 def nd_dense_init(scale, mode, distribution):
   """Initializer with in_axis, out_axis set at call time."""
   def init_fn(key, shape, dtype, in_axis, out_axis):
@@ -132,9 +137,10 @@ def nd_dense_init(scale, mode, distribution):
     return fn(key, shape, dtype)
   return init_fn
 
+
 def _normalize_axes(axes: Iterable[int], ndim: int) -> Tuple[int]:
   # A tuple by convention. len(axes_tuple) then also gives the rank efficiently.
-  return tuple([ax if ax >= 0 else ndim + ax for ax in axes])
+  return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
 
 
 def _canonicalize_tuple(x):
@@ -175,7 +181,7 @@ class DenseGeneral(nn.Module):
     inputs = jnp.asarray(inputs, self.dtype)
     axis = _normalize_axes(axis, inputs.ndim)
 
-    kernel_shape = tuple([inputs.shape[ax] for ax in axis]) + features
+    kernel_shape = tuple(inputs.shape[ax] for ax in axis) + features
     kernel_in_axis = np.arange(len(axis))
     kernel_out_axis = np.arange(len(axis), len(axis) + len(features))
     kernel = self.param(
@@ -201,8 +207,8 @@ def _convert_to_activation_function(
   elif callable(fn_or_string):
     return fn_or_string
   else:
-    raise ValueError("don't know how to convert %s to an activation function" %
-                     (fn_or_string,))
+    raise ValueError(f"""Don't know how to convert {fn_or_string}
+                         to an activation function""")
 
 
 class MultiHeadDotProductAttention(nn.Module):
@@ -274,17 +280,25 @@ class MultiHeadDotProductAttention(nn.Module):
     #       1/sqrt(depth_kq)!  This is folded into the initializers of the
     #       linear transformations, which is equivalent under Adafactor.
     depth_scaling = jnp.sqrt(self.head_dim).astype(self.dtype)
-    query_init = lambda *args: self.kernel_init(*args) / depth_scaling
+    def query_init(*args):
+      return self.kernel_init(*args) / depth_scaling
 
     # Project inputs_q to multi-headed q/k/v
     # dimensions are then [batch, length, num_heads, head_dim]
     query = projection(kernel_init=query_init, name='query')(inputs_q)
     key = projection(kernel_init=self.kernel_init, name='key')(inputs_kv)
     value = projection(kernel_init=self.kernel_init, name='value')(inputs_kv)
+    
+    print(f'input query: {jnp.shape(inputs_q)} kv: {jnp.shape(inputs_kv)}')
+    print(f'query: {jnp.shape(query)} kv: {jnp.shape(key)} {jnp.shape(value)}')
 
-    query = nn.with_logical_constraint(query, ('batch', 'length', 'heads', 'kv'))
+    query = nn.with_logical_constraint(
+        query, ('batch', 'length', 'heads', 'kv')
+    )
     key = nn.with_logical_constraint(key, ('batch', 'length', 'heads', 'kv'))
-    value = nn.with_logical_constraint(value, ('batch', 'length', 'heads', 'kv'))
+    value = nn.with_logical_constraint(
+        value, ('batch', 'length', 'heads', 'kv')
+    )
 
     if decode:
       # Detect if we're initializing by absence of existing cache data.
@@ -294,7 +308,8 @@ class MultiHeadDotProductAttention(nn.Module):
       # fusion optimization. This also enables the "scatter via one-hot
       # broadcast" trick, which means we do a one-hot broadcast instead of a
       # scatter/gather operations, resulting in a 3-4x speedup in practice.
-      swap_dims = lambda x: x[:-3] + tuple(x[i] for i in [-2, -1, -3])
+      def swap_dims(x):
+        return x[:-3] + tuple(x[i] for i in [-2, -1, -3])
       cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                  swap_dims(key.shape), key.dtype)
       cached_value = self.variable('cache', 'cached_value', jnp.zeros,
@@ -308,10 +323,9 @@ class MultiHeadDotProductAttention(nn.Module):
         # Sanity shape check of cached key against input query.
         expected_shape = (batch, 1, num_heads, head_dim)
         if expected_shape != query.shape:
-          raise ValueError('Autoregressive cache shape error, '
-                           'expected query shape %s instead got %s.' %
-                           (expected_shape, query.shape))
-
+          raise ValueError(f"""Autoregressive cache shape error,
+                           expected query shape %s instead got 
+                           {(expected_shape, query.shape)}""")
         # Create a OHE of the current index. NOTE: the index is increased below.
         cur_index = cache_index.value
         one_hot_indices = jax.nn.one_hot(cur_index, length, dtype=key.dtype)
@@ -435,6 +449,7 @@ class MlpBlock(nn.Module):
           name=dense_name)(
               inputs)
       x = _convert_to_activation_function(act_fn)(x)
+      self.sow('intermediates', 'activations', x)
       activations.append(x)
 
     # Take elementwise product of above intermediate activations.
@@ -491,8 +506,6 @@ class Embed(nn.Module):
     features: number of feature dimensions for each embedding.
     dtype: the dtype of the embedding vectors (default: float32).
     embedding_init: embedding initializer.
-    one_hot: performs the gather with a one-hot contraction rather than a true
-      gather. This is currently needed for SPMD partitioning.
   """
   num_embeddings: int
   features: int
@@ -500,7 +513,6 @@ class Embed(nn.Module):
   dtype: DType = jnp.float32
   attend_dtype: Optional[DType] = None
   embedding_init: Initializer = default_embed_init
-  one_hot: bool = False
   embedding: Array = dataclasses.field(init=False)
 
   def setup(self):
@@ -524,13 +536,8 @@ class Embed(nn.Module):
       inputs = inputs.astype(self.cast_input_dtype)
     if not jnp.issubdtype(inputs.dtype, jnp.integer):
       raise ValueError('Input type must be an integer or unsigned integer.')
-    if self.one_hot:
-      iota = lax.iota(jnp.int32, self.num_embeddings)
-      one_hot = jnp.array(inputs[..., jnp.newaxis] == iota, dtype=self.dtype)
-      output = jnp.dot(one_hot, jnp.asarray(self.embedding, self.dtype))
-    else:
-      output = jnp.asarray(self.embedding, self.dtype)[inputs]
-      output = nn.with_logical_constraint(output, ('batch', 'length', 'embed'))
+    output = jnp.asarray(self.embedding, self.dtype)[inputs]
+    output = nn.with_logical_constraint(output, ('batch', 'length', 'embed'))
     return output
 
   def attend(self, query: Array) -> Array:
@@ -888,10 +895,10 @@ class DecoderLayer(nn.Module):
   @nn.compact
   def __call__(self,
                inputs,
-               decoder_mask=None,
-               deterministic=False,
-               decode=False,
-               max_decode_length=None):
+               decoder_mask,
+               deterministic,
+               decode,
+               max_decode_length):
     cfg = self.config
 
     # Relative position embedding as attention biases.
@@ -989,7 +996,7 @@ class Decoder(nn.Module):
           BlockLayer,
           prevent_cse=not cfg.scan_layers,
           policy=policy,
-          static_argnums=(4, 5, 6))
+          static_argnums=(-1, -2, -3, -4))
     if cfg.scan_layers:
       initializing = self.is_mutable_collection('params')
       params_spec = (
@@ -1006,7 +1013,7 @@ class Decoder(nn.Module):
               'dropout': True
           },
           in_axes=(nn.broadcast, nn.broadcast, nn.broadcast,
-                   nn.broadcast, nn.broadcast),
+                   nn.broadcast),
           length=cfg.num_decoder_layers,
           metadata_params={nn.PARTITION_NAME: 'layers'})(
               config=cfg,
@@ -1018,10 +1025,10 @@ class Decoder(nn.Module):
         y = BlockLayer(
             config=cfg, name=f'layers_{lyr}')(
                 y,
-                decoder_mask=decoder_mask,
-                deterministic=deterministic,
-                decode=decode,
-                max_decode_length=max_decode_length)
+                decoder_mask,
+                deterministic,
+                decode,
+                max_decode_length)
 
     y = LayerNorm(dtype=cfg.dtype, name='decoder_norm')(y)
     y = nn.Dropout(
@@ -1046,9 +1053,11 @@ class Decoder(nn.Module):
 
 class Transformer(nn.Module):
   """An decoder-only Transformer model."""
+  # pylint: disable=attribute-defined-outside-init
   config: Config
 
   def setup(self):
+    """Initialize shared_embedding, decoder"""
     cfg = self.config
     self.shared_embedding = Embed(
         num_embeddings=cfg.vocab_size,
@@ -1056,7 +1065,6 @@ class Transformer(nn.Module):
         dtype=cfg.dtype,
         attend_dtype=jnp.float32,  # for logit training stability
         embedding_init=nn.initializers.normal(stddev=1.0),
-        one_hot=True,
         name='token_embedder')
 
     self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding)
